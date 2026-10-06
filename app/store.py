@@ -379,6 +379,17 @@ def next_received(conn):
 
 # ---------------------------------------------------------------- faults (test hooks)
 
+def force_artifact_digest(conn, export_id, digest, actor="api"):
+    """TEST-HOOK ONLY: repoint the published digest after a simulated tamper
+    (an attacker who rewrites both the artifact file and the bookkeeping)."""
+    with immediate(conn):
+        conn.execute(
+            "UPDATE exports SET artifact_digest = ?, updated_at = ? WHERE export_id = ?",
+            (digest, utcnow(), export_id),
+        )
+        journal(conn, export_id, actor, "fault_forced_artifact_digest", digest)
+
+
 def set_fault(conn, export_id, mode, actor="api"):
     assert mode in FAULT_MODES
     with immediate(conn):

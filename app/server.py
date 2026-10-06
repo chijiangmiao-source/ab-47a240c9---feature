@@ -9,19 +9,26 @@ Endpoints:
   GET  /api/exports                    list exports (stage, digests, receipt)
   GET  /api/exports/{id}               detail incl. journal + lease
   GET  /api/exports/{id}/artifact      download (only verified, published)
+  GET  /api/exports/{id}/records/{n}/evidence  per-record replay evidence
   POST /api/test/fault                 fault injection (TEST_HOOKS=1 only)
 """
+import hashlib
 import json
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import artifacts, config, masking, store
+from . import artifacts, config, evidence, masking, store
+from .canonical import canonical
 
 MAX_BODY = 1 << 20
 MAX_RECORDS = 100
 EXPORT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# TEST_HOOKS-only tampering with an already-published artifact, to prove the
+# evidence/download paths refuse unverifiable or non-reproducible content.
+ARTIFACT_FAULT_MODES = ("corrupt_artifact", "remove_artifact", "desync_artifact")
 
 INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "public", "index.html")
 
@@ -163,6 +170,10 @@ class Handler(BaseHTTPRequestHandler):
         if match:
             self._download_artifact(match.group(1))
             return
+        match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)/records/(-?[0-9]+)/evidence", path)
+        if match:
+            self._get_record_evidence(match.group(1), match.group(2))
+            return
         self._send_error_json(404, "not_found", "no such route: %s" % path)
 
     def _serve_index(self):
@@ -186,6 +197,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_error_json(404, "not_found", "unknown export_id: %s" % export_id)
                 return
             payload = _public_export(row)
+            payload["record_count"] = len(json.loads(row["records"]))
             payload["events"] = store.export_events(conn, export_id)
             lease = store.get_lease(conn, "export:" + export_id)
             payload["lease"] = lease
@@ -224,6 +236,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _get_record_evidence(self, export_id, index_str):
+        conn = store.connect()
+        try:
+            row = store.get_export(conn, export_id)
+        finally:
+            conn.close()
+        if not row:
+            self._send_error_json(404, "not_found", "unknown export_id: %s" % export_id)
+            return
+        try:
+            payload = evidence.record_evidence(row, int(index_str))
+        except evidence.EvidenceError as exc:
+            self._send_error_json(exc.status, exc.code, exc.message)
+            return
+        except artifacts.ArtifactMissing:
+            self._send_error_json(410, "artifact_missing", "published artifact file is gone")
+            return
+        except artifacts.DigestMismatch:
+            self._send_error_json(500, "artifact_unverified",
+                                  "artifact failed digest verification; refusing to serve evidence")
+            return
+        self._send_json(200, payload)
+
     # ------------------------------------------------------------ PUT/POST
     def _route_mutation(self, method, path, doc):
         if method == "PUT" and path == "/api/rules":
@@ -257,9 +292,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             export_id = doc.get("export_id")
             mode = doc.get("mode")
-            if not isinstance(export_id, str) or mode not in store.FAULT_MODES:
+            if not isinstance(export_id, str):
+                raise ApiError(422, "invalid_fault", "need export_id")
+            if mode in ARTIFACT_FAULT_MODES:
+                self._apply_artifact_fault(export_id, mode)
+                self._send_json(202, {"ok": True, "export_id": export_id, "mode": mode})
+                return
+            if mode not in store.FAULT_MODES:
                 raise ApiError(422, "invalid_fault",
-                               "need export_id and mode in %s" % "/".join(store.FAULT_MODES))
+                               "need export_id and mode in %s"
+                               % "/".join(store.FAULT_MODES + ARTIFACT_FAULT_MODES))
             conn = store.connect()
             try:
                 store.set_fault(conn, export_id, mode)
@@ -268,6 +310,47 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(202, {"ok": True, "export_id": export_id, "mode": mode})
             return
         self._send_error_json(404, "not_found", "no such route: %s %s" % (method, path))
+
+    def _apply_artifact_fault(self, export_id, mode):
+        """TEST_HOOKS only: tamper with a published artifact so acceptance can
+        prove the evidence/download paths refuse bad content."""
+        conn = store.connect()
+        try:
+            row = store.get_export(conn, export_id)
+            if not row:
+                raise ApiError(404, "not_found", "unknown export_id: %s" % export_id)
+            if row["stage"] != "PUBLISHED" or not row["artifact_path"]:
+                raise ApiError(409, "not_published", "artifact faults require a published export")
+            path = row["artifact_path"]
+            if mode == "corrupt_artifact":
+                if not os.path.exists(path):
+                    raise ApiError(409, "artifact_missing", "artifact file already gone")
+                with open(path, "ab") as fh:
+                    fh.write(b"\ntampered")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                detail = "appended bytes to %s" % path
+            elif mode == "remove_artifact":
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    raise ApiError(409, "artifact_missing", "artifact file already gone")
+                detail = "removed %s" % path
+            else:  # desync_artifact: valid JSON, digest-consistent, but not reproducible
+                data = artifacts.load_verified(row)
+                doc = json.loads(data.decode("utf-8"))
+                doc["records"][0]["__desync__"] = True
+                body = (canonical(doc) + "\n").encode("utf-8")
+                with open(path, "wb") as fh:
+                    fh.write(body)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                digest = hashlib.sha256(body).hexdigest()
+                store.force_artifact_digest(conn, export_id, digest)
+                detail = "rewrote %s and forced digest %s" % (path, digest)
+            store.journal(conn, export_id, "api", "fault_artifact_" + mode, detail)
+        finally:
+            conn.close()
 
 
 def main():

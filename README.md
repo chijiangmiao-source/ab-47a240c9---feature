@@ -33,6 +33,13 @@
   文件定期清扫。`PUBLISHED` 为终态，任何路径都不能使其倒退。
 - **唯一发布**：租约串行化 + `artifacts` 表部分唯一索引（每导出仅一条 published）
   + 不可覆盖链接 + 阶段 CAS，四重保证两个 worker 并行时同一导出只发布一次。
+- **单条记录证据**：`GET /api/exports/{id}/records/{n}/evidence` 对已发布导出
+  重新推导第 n 条记录——先核验已发布工件摘要，再用冻结输入 + 冻结规则快照重演
+  整个工件并比对摘要，最后与该工件的同序记录逐字段比对。返回稳定序号、冻结
+  规则摘要、遮蔽后字段值与每字段处理（保留/删除/替换/取整/哈希）的证据；证据
+  值一律取自遮蔽后记录，绝不泄露被删除或替换的原始值。未发布、序号越界、工件
+  缺失/被篡改、重演不一致都明确拒绝（409/404/410/500），绝不返回猜测结果。
+  旧导出的证据始终指向其冻结规则快照，与发布后改动的当前规则互不影响。
 
 ## 快速开始（Docker Compose）
 
@@ -54,13 +61,18 @@ docker compose down -v                                   # 重置全部状态
 ## verify 验收内容（执行后退出，退出码即结果）
 
 1. **构建检查**：`python -m compileall app verify tests`
-2. **代码测试**：`python -m unittest discover -s tests`（48 个用例：规范化、遮蔽、
-   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态）
+2. **代码测试**：`python -m unittest discover -s tests`（59 个用例：规范化、遮蔽、
+   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态、
+   单条记录证据与各类拒绝）
 3. **API/HTTP 冒烟**：
    - 规则改动后，已冻结导出仍按冻结快照导出（E1 用 R1、E2 用 R2，互不影响）
    - 崩溃恢复：暂存完整后崩溃 → 收敛到同一完整工件；写一半崩溃 → 清理残缺并重处理
    - 业务等价重传 → 首次回执且无第二个工件；记录/规则快照不同 → 409 且证据保留
    - 下载接口在崩溃窗口内只返回 409，绝不暴露未核验内容
+   - 记录证据：记录选择返回稳定序号/冻结规则摘要/逐字段处理证据，不泄露被替换
+     的原始值；规则更新后旧导出证据仍指向原规则快照，新导出独立反映新快照；
+     序号越界 → 404，未发布 → 409，工件被改写（含账目摘要同步被篡改的 desync）
+     → 409 重演不一致，工件被追加字节 → 500，工件缺失 → 410，均明确拒绝
 
 ## 本地开发（无 Docker）
 
@@ -79,7 +91,8 @@ python3 -m unittest discover -s tests -t .     # 单元测试
 | GET | `/api/exports` | 列表：阶段、冻结规则摘要、输入摘要、工件摘要 |
 | GET | `/api/exports/{id}` | 详情 + 处理日志 + 当前租约 |
 | GET | `/api/exports/{id}/artifact` | 下载已发布工件（摘要核验，否则 409/410/500） |
-| POST | `/api/test/fault` | 故障注入（仅 `TEST_HOOKS=1`）：`crash_partial_write` / `crash_after_staged` |
+| GET | `/api/exports/{id}/records/{n}/evidence` | 单条记录证据：重演比对后返回序号/冻结规则摘要/逐字段处理（否则 404/409/410/500） |
+| POST | `/api/test/fault` | 故障注入（仅 `TEST_HOOKS=1`）：`crash_partial_write` / `crash_after_staged` / `corrupt_artifact` / `remove_artifact` / `desync_artifact` |
 
 ## 配置（环境变量）
 

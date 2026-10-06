@@ -7,6 +7,9 @@ the live HTTP API through the required scenarios:
   2. crash recovery (converge a complete staged artifact; clean up a partial one)
   3. business-equivalent retransmission (first receipt, no second artifact)
      and conflict handling (different records or rules snapshot)
+  4. per-record evidence: record selection, frozen rules identity after a
+     rules change, replay verification, and explicit refusal for out-of-range
+     indexes, unpublished exports, and desynced/corrupted/missing artifacts
 
 Exits 0 when everything passes, 1 otherwise.
 """
@@ -136,7 +139,7 @@ def wait_for_api():
 
 
 def smoke():
-    e1, e2, e3, e4, e5 = ("VFY%d-%s" % (i, RUN) for i in range(1, 6))
+    e1, e2, e3, e4, e5, e6 = ("VFY%d-%s" % (i, RUN) for i in range(1, 7))
     recs = [
         {"ts": "2026-10-06T01:00:00Z", "lat": 31.230416, "lon": 121.473701, "depth_m": 42.51, "vessel_id": "HAICE-01"},
         {"ts": "2026-10-06T01:05:00Z", "lat": 31.231102, "lon": 121.480233, "depth_m": 43.04, "vessel_id": "HAICE-01"},
@@ -151,6 +154,7 @@ def smoke():
     status, raw, headers = req("GET", "/")
     check("operator page served", status == 200 and "text/html" in headers.get("Content-Type", ""))
     check("page polls real API", b"/api/exports" in raw and b"fetch(" in raw)
+    check("page offers record evidence UI", b"/evidence" in raw)
 
     step("设置规则 R1（遮蔽 depth_m / 散列 vessel_id）")
     status, raw, _ = req("PUT", "/api/rules", rules_r1)
@@ -236,6 +240,50 @@ def smoke():
         check("E1 still follows frozen R1 (depth redacted, lat kept)",
               doc["records"][0]["depth_m"] == "***" and doc["records"][0]["lat"] == 31.230416)
 
+    step("单条记录证据：记录选择，且规则更新后旧导出仍指向原规则快照")
+    status, raw, _ = req("GET", "/api/exports/%s/records/0/evidence" % e1)
+    check("evidence E1 record 0 -> 200", status == 200, "HTTP %s %s" % (status, raw[:300]))
+    ev1 = as_json(raw) if status == 200 else {}
+    check("evidence carries stable index + frozen R1 identity",
+          ev1.get("record_index") == 0 and ev1.get("record_count") == 2
+          and ev1.get("rules_digest") == d1
+          and ev1.get("rules_version") == receipt1["rules_version"]
+          and ev1.get("artifact_digest") == a1)
+    f1 = {f["field"]: f for f in ev1.get("fields", [])}
+    check("evidence per-field actions (keep/redact/hash)",
+          f1.get("depth_m", {}).get("action") == "redact"
+          and f1.get("depth_m", {}).get("masked_value") == "***"
+          and f1.get("vessel_id", {}).get("action") == "hash"
+          and f1.get("vessel_id", {}).get("masked_value") not in (None, "HAICE-01")
+          and f1.get("lat", {}).get("action") == "keep"
+          and f1.get("lat", {}).get("masked_value") == 31.230416)
+    check("evidence replays frozen decision against published artifact",
+          ev1.get("replay", {}).get("whole_artifact_replay") is True
+          and ev1.get("replay", {}).get("record_match") is True)
+    check("evidence never leaks replaced originals",
+          b"42.51" not in raw and b"HAICE-01" not in raw)
+
+    status, raw, _ = req("GET", "/api/exports/%s/records/1/evidence" % e1)
+    ev1b = as_json(raw) if status == 200 else {}
+    check("evidence E1 record 1 -> stable index 1, same-order record",
+          status == 200 and ev1b.get("record_index") == 1
+          and ev1b.get("record", {}).get("ts") == "2026-10-06T01:05:00Z")
+
+    status, raw, _ = req("GET", "/api/exports/%s/records/99/evidence" % e1)
+    check("out-of-range index -> 404 record_not_found",
+          status == 404 and as_json(raw).get("error") == "record_not_found",
+          "HTTP %s %s" % (status, raw[:200]))
+
+    status, raw, _ = req("GET", "/api/exports/%s/records/0/evidence" % e2)
+    ev2 = as_json(raw) if status == 200 else {}
+    f2 = {f["field"]: f for f in ev2.get("fields", [])}
+    check("E2 evidence independently follows R2",
+          status == 200 and ev2.get("rules_digest") == d2
+          and f2.get("lat", {}).get("action") == "redact"
+          and f2.get("depth_m", {}).get("action") == "keep"
+          and f2.get("depth_m", {}).get("masked_value") == 42.51)
+    check("E2 evidence does not leak redacted lat", b"31.230416" not in raw)
+
     step("崩溃恢复 A：暂存完整工件后进程退出 → 收敛到同一完整工件")
     status, raw, _ = req("POST", "/api/test/fault", {"export_id": e3, "mode": "crash_after_staged"})
     check("arm fault crash_after_staged", status == 202, "HTTP %s %s" % (status, raw[:200]))
@@ -274,28 +322,39 @@ def smoke():
         check("E4 download verified", status == 200
               and hashlib.sha256(raw).hexdigest() == detail4["artifact_digest"])
 
-    step("下载接口不暴露未核验内容（崩溃窗口内只能 409，不能 200）")
+    step("下载/证据接口不暴露未核验内容（崩溃窗口内只能 409，不能 200）")
     req("POST", "/api/test/fault", {"export_id": e5, "mode": "crash_partial_write"})
     status, raw, _ = req("POST", "/api/exports", {"export_id": e5, "records": recs})
     check("submit E5 -> 201", status == 201)
     saw_409 = False
+    saw_ev_409 = False
     exposed = False
+    ev_exposed = False
     deadline = time.time() + 150
     while time.time() < deadline:
         code, body, _ = download(e5)
-        d = wait_for_stage(e5, "PUBLISHED", 1)  # stage probe after the download
+        ev_code, _, _ = req("GET", "/api/exports/%s/records/0/evidence" % e5)
+        d = wait_for_stage(e5, "PUBLISHED", 1)  # stage probe after the downloads
+        published = d is not None and d["stage"] == "PUBLISHED"
         if code == 200:
             # 200 is legitimate only when the export is PUBLISHED (stage never
             # regresses, so a PUBLISHED probe after the 200 is conclusive).
-            if d and d["stage"] == "PUBLISHED":
+            if published:
                 break
             exposed = True
             break
+        if ev_code == 200 and not published:
+            ev_exposed = True
+            break
         if code == 409:
             saw_409 = True
+        if ev_code == 409:
+            saw_ev_409 = True
         time.sleep(0.4)
     check("unpublished content never served", not exposed)
     check("download refused while unverified (409 observed)", saw_409)
+    check("unverifiable evidence never served", not ev_exposed)
+    check("evidence refused while unpublished (409 observed)", saw_ev_409)
 
     step("发布后的业务等价重传：仍返回首次回执且不产生第二个工件")
     status, raw, _ = req("POST", "/api/exports", {"export_id": e2, "records": reordered})
@@ -306,9 +365,44 @@ def smoke():
           detail2b is not None and detail2b["artifact_digest"] == detail2["artifact_digest"])
     check("exactly one published artifact file for E2", len(published_files(e2)) == 1)
 
+    step("异常工件拒绝：重演不一致 / 摘要核验失败 / 工件缺失，均明确拒绝")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e6, "records": recs})
+    check("submit E6 -> 201", status == 201)
+    detail6 = wait_for_stage(e6, "PUBLISHED", 90)
+    check("E6 published", detail6 is not None and detail6["stage"] == "PUBLISHED")
+    status, raw, _ = req("GET", "/api/exports/%s/records/0/evidence" % e6)
+    check("E6 evidence baseline -> 200", status == 200, "HTTP %s %s" % (status, raw[:200]))
+
+    # 工件与账目摘要同时被篡改：只有重演比对能发现，证据必须拒绝
+    status, raw, _ = req("POST", "/api/test/fault", {"export_id": e6, "mode": "desync_artifact"})
+    check("fault desync_artifact -> 202", status == 202, "HTTP %s %s" % (status, raw[:200]))
+    status, raw, _ = req("GET", "/api/exports/%s/records/0/evidence" % e6)
+    check("desynced artifact -> 409 replay_mismatch",
+          status == 409 and as_json(raw).get("error") == "replay_mismatch",
+          "HTTP %s %s" % (status, raw[:200]))
+    status, raw, _ = download(e6)
+    check("download layer alone cannot catch desync (digest was forced)",
+          status == 200, "HTTP %s" % status)
+
+    # 工件文件被追加字节：摘要核验失败，证据必须拒绝
+    status, raw, _ = req("POST", "/api/test/fault", {"export_id": e6, "mode": "corrupt_artifact"})
+    check("fault corrupt_artifact -> 202", status == 202, "HTTP %s %s" % (status, raw[:200]))
+    status, raw, _ = req("GET", "/api/exports/%s/records/0/evidence" % e6)
+    check("corrupted artifact -> 500 artifact_unverified",
+          status == 500 and as_json(raw).get("error") == "artifact_unverified",
+          "HTTP %s %s" % (status, raw[:200]))
+
+    # 工件文件丢失：证据必须拒绝
+    status, raw, _ = req("POST", "/api/test/fault", {"export_id": e6, "mode": "remove_artifact"})
+    check("fault remove_artifact -> 202", status == 202, "HTTP %s %s" % (status, raw[:200]))
+    status, raw, _ = req("GET", "/api/exports/%s/records/0/evidence" % e6)
+    check("missing artifact -> 410 artifact_missing",
+          status == 410 and as_json(raw).get("error") == "artifact_missing",
+          "HTTP %s %s" % (status, raw[:200]))
+
     step("终态检查：无残缺临时工件残留")
     leftovers = []
-    for eid in (e1, e2, e3, e4, e5):
+    for eid in (e1, e2, e3, e4, e5, e6):
         leftovers.extend(tmp_files(eid))
     check("no temp artifacts left behind", leftovers == [], str(leftovers))
 

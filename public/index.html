@@ -85,10 +85,29 @@
     <div id="lease" class="meta"></div>
     <pre id="events">点击列表中的“日志”查看。</pre>
   </section>
+
+  <section class="wide" id="evidence">
+    <h2>⑤ 单条记录核验（仅已发布且工件摘要可核验的导出）</h2>
+    <div class="row">
+      <div>
+        <label for="evExportId">导出标识</label>
+        <input type="text" id="evExportId" value="">
+      </div>
+      <div>
+        <label for="evIndex">记录序号（0 起，与已发布工件同序）</label>
+        <input type="number" id="evIndex" min="0" step="1" value="0">
+      </div>
+    </div>
+    <button id="loadEvidence">核验该记录</button>
+    <div class="meta" id="evStatus">选择导出与序号后点击核验：服务将用冻结输入与规则重演该条记录，并与已发布工件的同序记录比对。</div>
+    <div id="evBody"></div>
+  </section>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 const short = (d) => d ? d.slice(0, 12) + "…" : "—";
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const ACTION_CN = { keep: "保留", drop: "删除", redact: "替换", round: "取整", hash: "哈希" };
 
 async function api(method, path, body) {
   const opt = { method, headers: {} };
@@ -151,7 +170,7 @@ async function refreshExports() {
       <td class="mono" title="${e.artifact_digest || ""}">${short(e.artifact_digest)}</td>
       <td>${e.attempts}</td>
       <td class="mono">${e.updated_at}</td>
-      <td>${dl} · <a href="#" onclick="showDetail('${e.export_id}');return false;">日志</a></td>
+      <td>${dl} · <a href="#" onclick="showDetail('${e.export_id}');return false;">日志</a> · <a href="#evidence" onclick="pickEvidence('${e.export_id}');return false;">核验</a></td>
     </tr>`;
   }).join("");
   $("rows").innerHTML = rows || `<tr><td colspan="8" class="meta">暂无导出。</td></tr>`;
@@ -160,13 +179,61 @@ async function refreshExports() {
 async function showDetail(exportId) {
   const { status, data } = await api("GET", "/api/exports/" + encodeURIComponent(exportId));
   if (status !== 200) return;
-  $("detailFor").textContent = "— " + exportId;
+  $("detailFor").textContent = "— " + exportId + "（记录数 " + data.record_count + "）";
+  $("evExportId").value = exportId;
   $("lease").innerHTML = data.lease
     ? "当前租约持有者：<b class='mono'>" + data.lease.owner + "</b>（fencing=" + data.lease.fencing + "，到期 " + new Date(data.lease.expires_at * 1000).toISOString() + "）"
     : "当前无有效租约。";
   $("events").textContent = data.events.map(e => `${e.ts}  [${e.actor}]  ${e.event}${e.detail ? "  — " + e.detail : ""}`).join("\n") || "（无事件）";
 }
 window.showDetail = showDetail;
+
+function pickEvidence(exportId) {
+  $("evExportId").value = exportId;
+  loadEvidence();
+}
+window.pickEvidence = pickEvidence;
+
+$("loadEvidence").onclick = () => loadEvidence();
+
+async function loadEvidence() {
+  const id = $("evExportId").value.trim();
+  const idx = $("evIndex").value.trim() || "0";
+  $("evBody").innerHTML = "";
+  if (!id) {
+    $("evStatus").innerHTML = "<span class='err'>不可核验：请先填写导出标识。</span>";
+    return;
+  }
+  // 状态一：加载中
+  $("evStatus").innerHTML = "加载中…（查询真实 API）";
+  const { status, data } = await api("GET",
+    "/api/exports/" + encodeURIComponent(id) + "/records/" + encodeURIComponent(idx) + "/evidence");
+  if (status !== 200) {
+    // 状态二：不可核验（未发布 / 序号越界 / 工件缺失或异常 / 重演不一致）
+    const code = (data && data.error) ? data.error : ("HTTP " + status);
+    const msg = (data && data.message) ? data.message : "请求失败";
+    $("evStatus").innerHTML = "<span class='err'>不可核验：" + esc(msg) + "（" + esc(code) + "）</span>";
+    return;
+  }
+  // 状态三：可复核结果
+  $("evStatus").innerHTML = "<span class='ok'>可复核：冻结输入 + 冻结规则重演与已发布工件同序记录一致。</span>";
+  const fieldRows = data.fields.map(f => {
+    const val = f.present ? JSON.stringify(f.masked_value) : "（无值：字段已被删除）";
+    return `<tr><td class="mono">${esc(f.field)}</td><td>${esc(ACTION_CN[f.action] || f.action)}</td><td class="mono">${esc(val)}</td></tr>`;
+  }).join("");
+  $("evBody").innerHTML = `
+    <div class="meta">记录序号 <b>#${data.record_index}</b> / 共 ${data.record_count} 条 ·
+      冻结规则 <b class="mono">${esc(short(data.rules_digest))}</b> (v${data.rules_version}) ·
+      已发布工件摘要 <b class="mono">${esc(short(data.artifact_digest))}</b> ·
+      重演核验 <span class="ok">通过</span></div>
+    <div class="meta">冻结规则摘要：<span class="mono">${esc(JSON.stringify(data.rules_summary))}</span></div>
+    <table>
+      <thead><tr><th>字段</th><th>处理</th><th>遮蔽后值</th></tr></thead>
+      <tbody>${fieldRows}</tbody>
+    </table>
+    <label>完整证据 JSON</label>
+    <pre>${esc(JSON.stringify(data, null, 2))}</pre>`;
+}
 
 // 预填示例
 $("exportId").value = "TRACK-" + new Date().toISOString().slice(0,10).replaceAll("-","") + "-001";
