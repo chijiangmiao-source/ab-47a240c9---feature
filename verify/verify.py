@@ -7,6 +7,8 @@ the live HTTP API through the required scenarios:
   2. crash recovery (converge a complete staged artifact; clean up a partial one)
   3. business-equivalent retransmission (first receipt, no second artifact)
      and conflict handling (different records or rules snapshot)
+  4. per-record evidence: record selection, frozen-snapshot replay for old/new
+     exports, out-of-range refusal, and rejection of missing/corrupt artifacts
 
 Exits 0 when everything passes, 1 otherwise.
 """
@@ -93,6 +95,10 @@ def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
 
 
+def evidence(export_id, index):
+    return req("GET", "/api/exports/%s/evidence?index=%s" % (export_id, index))
+
+
 # ------------------------------------------------------------------ phases
 
 def build_checks():
@@ -151,6 +157,7 @@ def smoke():
     status, raw, headers = req("GET", "/")
     check("operator page served", status == 200 and "text/html" in headers.get("Content-Type", ""))
     check("page polls real API", b"/api/exports" in raw and b"fetch(" in raw)
+    check("page offers record evidence selection", b"/evidence" in raw and "复核".encode() in raw)
 
     step("设置规则 R1（遮蔽 depth_m / 散列 vessel_id）")
     status, raw, _ = req("PUT", "/api/rules", rules_r1)
@@ -235,6 +242,82 @@ def smoke():
         doc = as_json(raw)
         check("E1 still follows frozen R1 (depth redacted, lat kept)",
               doc["records"][0]["depth_m"] == "***" and doc["records"][0]["lat"] == 31.230416)
+
+    step("单条记录复核：序号选择 + 冻结规则重演（E1→R1，E2→R2）")
+    status, raw, _ = evidence(e1, 0)
+    ev1a = as_json(raw) if status == 200 else {}
+    check("E1 evidence index 0 -> 200 verified", status == 200 and ev1a.get("status") == "verified",
+          "HTTP %s %s" % (status, raw[:200]))
+    if status == 200:
+        check("E1 evidence stable index/count", ev1a["record_index"] == 0 and ev1a["record_count"] == 2)
+        check("E1 evidence points at frozen R1 snapshot",
+              ev1a["frozen_rules"]["rules_digest"] == d1)
+        check("E1 artifact digest verified + replayed",
+              ev1a["artifact_digest_verified"] is True and ev1a["replayed_from_frozen"] is True
+              and ev1a["artifact_digest"] == a1)
+        by_field = {f["field"]: f for f in ev1a["fields"]}
+        check("E1 field actions (redact/hash/keep)",
+              by_field["depth_m"]["action"] == "redact" and by_field["depth_m"]["output"] == "***"
+              and by_field["vessel_id"]["action"] == "hash"
+              and len(by_field["vessel_id"]["output"]) == 10
+              and by_field["lat"]["action"] == "keep" and by_field["lat"]["output"] == 31.230416)
+        check("E1 masked record matches artifact same-order record",
+              ev1a["masked_record"] == doc["records"][0])
+        blob = raw.decode("utf-8")
+        check("E1 evidence leaks no deleted/replaced originals",
+              "HAICE-01" not in blob and "42.51" not in blob)
+    status, raw, _ = evidence(e1, 1)
+    ev1b = as_json(raw) if status == 200 else {}
+    check("E1 evidence index 1 is the second record",
+          status == 200 and ev1b["masked_record"]["ts"] == "2026-10-06T01:05:00Z"
+          and ev1b["masked_record"]["depth_m"] == "***", "HTTP %s" % status)
+    status, raw, _ = evidence(e2, 0)
+    ev2 = as_json(raw) if status == 200 else {}
+    check("E2 evidence independently reflects frozen R2",
+          status == 200 and ev2.get("frozen_rules", {}).get("rules_digest") == d2
+          and ev2["masked_record"]["lat"] == "***"
+          and ev2["masked_record"]["depth_m"] == 42.51, "HTTP %s" % status)
+    check("old export evidence stays on R1 after further rule reads",
+          ev1a["frozen_rules"]["rules_digest"] == d1 and ev2["frozen_rules"]["rules_digest"] != d1)
+
+    step("单条记录复核：越界序号 / 非法序号 / 未发布导出必须明确拒绝")
+    status, raw, _ = evidence(e1, 2)
+    check("out-of-range index -> 404 index_out_of_range",
+          status == 404 and as_json(raw).get("error") == "index_out_of_range",
+          "HTTP %s %s" % (status, raw[:160]))
+    status, raw, _ = req("GET", "/api/exports/%s/evidence?index=abc" % e1)
+    check("non-integer index -> 422 invalid_index",
+          status == 422 and as_json(raw).get("error") == "invalid_index", "HTTP %s" % status)
+    e6 = "VFY6-%s" % RUN
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e6, "records": recs})
+    check("submit E6 -> 201", status == 201)
+    status, raw, _ = evidence(e6, 0)
+    check("evidence on unpublished export -> 409 not_published",
+          status == 409 and as_json(raw).get("error") == "not_published", "HTTP %s" % status)
+
+    step("异常工件拒绝：工件缺失 / 摘要不一致时不返回猜测结果")
+    e6d = wait_for_stage(e6, "PUBLISHED", 90)
+    check("E6 published", e6d is not None and e6d["stage"] == "PUBLISHED")
+    status0, _, _ = evidence(e6, 0)
+    check("E6 evidence verifiable before tamper", status0 == 200, "HTTP %s" % status0)
+    status, raw, _ = req("POST", "/api/test/fault", {"export_id": e6, "mode": "corrupt_artifact"})
+    check("arm corrupt_artifact on E6", status == 202, "HTTP %s %s" % (status, raw[:160]))
+    status, raw, _ = evidence(e6, 0)
+    check("corrupt artifact -> 410 artifact_unverified",
+          status == 410 and as_json(raw).get("error") == "artifact_unverified", "HTTP %s" % status)
+    status, raw, _ = download(e6)
+    check("corrupt artifact download also refused", status in (410, 500), "HTTP %s" % status)
+
+    e7 = "VFY7-%s" % RUN
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e7, "records": recs})
+    check("submit E7 -> 201", status == 201)
+    e7d = wait_for_stage(e7, "PUBLISHED", 90)
+    check("E7 published", e7d is not None and e7d["stage"] == "PUBLISHED")
+    status, raw, _ = req("POST", "/api/test/fault", {"export_id": e7, "mode": "delete_artifact"})
+    check("arm delete_artifact on E7", status == 202, "HTTP %s %s" % (status, raw[:160]))
+    status, raw, _ = evidence(e7, 0)
+    check("missing artifact -> 410 artifact_missing",
+          status == 410 and as_json(raw).get("error") == "artifact_missing", "HTTP %s" % status)
 
     step("崩溃恢复 A：暂存完整工件后进程退出 → 收敛到同一完整工件")
     status, raw, _ = req("POST", "/api/test/fault", {"export_id": e3, "mode": "crash_after_staged"})

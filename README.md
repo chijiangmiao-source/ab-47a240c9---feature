@@ -54,10 +54,13 @@ docker compose down -v                                   # 重置全部状态
 ## verify 验收内容（执行后退出，退出码即结果）
 
 1. **构建检查**：`python -m compileall app verify tests`
-2. **代码测试**：`python -m unittest discover -s tests`（48 个用例：规范化、遮蔽、
-   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态）
+2. **代码测试**：`python -m unittest discover -s tests`（62 个用例：规范化、遮蔽、
+   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态、
+   单记录证据重演/越界/异常工件拒绝/冻结规则快照）
 3. **API/HTTP 冒烟**：
    - 规则改动后，已冻结导出仍按冻结快照导出（E1 用 R1、E2 用 R2，互不影响）
+   - 单记录证据：记录序号选择、字段级保留/删除/替换/取整/哈希证据且不泄露原值，
+     规则更新后旧导出仍指向原规则快照；越界/非法序号/未发布/工件缺失或被篡改均被拒绝
    - 崩溃恢复：暂存完整后崩溃 → 收敛到同一完整工件；写一半崩溃 → 清理残缺并重处理
    - 业务等价重传 → 首次回执且无第二个工件；记录/规则快照不同 → 409 且证据保留
    - 下载接口在崩溃窗口内只返回 409，绝不暴露未核验内容
@@ -78,8 +81,28 @@ python3 -m unittest discover -s tests -t .     # 单元测试
 | POST | `/api/exports` | 提交 `{export_id, records}` → 201 / 200(replay) / 409(conflict) |
 | GET | `/api/exports` | 列表：阶段、冻结规则摘要、输入摘要、工件摘要 |
 | GET | `/api/exports/{id}` | 详情 + 处理日志 + 当前租约 |
+| GET | `/api/exports/{id}/evidence?index=N` | 单条记录复核证据（仅已发布且工件摘要可核验） |
 | GET | `/api/exports/{id}/artifact` | 下载已发布工件（摘要核验，否则 409/410/500） |
-| POST | `/api/test/fault` | 故障注入（仅 `TEST_HOOKS=1`）：`crash_partial_write` / `crash_after_staged` |
+| POST | `/api/test/fault` | 故障注入（仅 `TEST_HOOKS=1`）：`crash_partial_write` / `crash_after_staged` / `delete_artifact` / `corrupt_artifact` |
+
+## 单条记录复核证据
+
+协作方收到已发布航迹后，值班员可在导出详情中选择一条记录（稳定序号，0 起）复核。
+`GET /api/exports/{id}/evidence?index=N` 只在以下条件全部成立时给出证据，否则明确拒绝、
+绝不返回猜测结果：
+
+- 导出处于终态 `PUBLISHED`（否则 409 `not_published`）；
+- 工件文件存在且 sha256 与冻结的 `artifact_digest` 一致（缺失 → 410 `artifact_missing`，
+  不一致 → 410 `artifact_unverified`）；
+- 序号在工件记录数范围内（越界 → 404 `index_out_of_range`，非整数 → 422 `invalid_index`）；
+- 用**冻结输入**与**冻结规则快照**重新推导的该条记录，与已发布工件的**同序**记录
+  canonical 一致，且整条工件重演摘要一致（不一致 → 410 `replay_mismatch`）。
+
+响应包含：稳定序号与记录总数、回执与时间戳、冻结规则摘要（版本/摘要/逐条动作）、
+输入与工件摘要、遮蔽后的记录，以及每个字段的处置证据——`keep`（保留）、`drop`（删除）、
+`redact`（替换）、`round`（取整）、`hash`（哈希）。证据中只出现遮蔽后的值与规则参数，
+**不包含**被删除/替换/哈希前的原始值。规则在导出发布后被修改不影响旧证据：证据始终从该
+导出冻结的规则快照重推；按新规则发布的新导出独立携带新快照。
 
 ## 配置（环境变量）
 

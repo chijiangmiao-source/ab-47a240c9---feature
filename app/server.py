@@ -8,6 +8,7 @@ Endpoints:
   POST /api/exports                    submit records under a stable export id
   GET  /api/exports                    list exports (stage, digests, receipt)
   GET  /api/exports/{id}               detail incl. journal + lease
+  GET  /api/exports/{id}/evidence      per-record evidence: re-derive + compare
   GET  /api/exports/{id}/artifact      download (only verified, published)
   POST /api/test/fault                 fault injection (TEST_HOOKS=1 only)
 """
@@ -15,9 +16,9 @@ import json
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from . import artifacts, config, masking, store
+from . import artifacts, config, evidence, masking, store
 
 MAX_BODY = 1 << 20
 MAX_RECORDS = 100
@@ -102,8 +103,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ dispatch
     def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        query = parse_qs(parsed.query, keep_blank_values=True)
         try:
-            self._route_get(urlparse(self.path).path.rstrip("/") or "/")
+            self._route_get(path, query)
+        except evidence.EvidenceError as exc:
+            self._send_error_json(exc.status, exc.code, exc.message)
         except ApiError as exc:
             self._send_error_json(exc.status, exc.code, exc.message)
         except Exception as exc:  # noqa: BLE001 - never leak a stack to clients
@@ -127,7 +133,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json(500, "internal_error", repr(exc))
 
     # ------------------------------------------------------------ GET
-    def _route_get(self, path):
+    def _route_get(self, path, query):
         if path == "/healthz":
             self._send_json(200, {"ok": True, "ts": store.utcnow()})
             return
@@ -155,13 +161,17 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
             self._send_json(200, {"exports": [_public_export(row) for row in rows]})
             return
-        match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)", path)
+        match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)/evidence", path)
         if match:
-            self._get_export_detail(match.group(1))
+            self._get_record_evidence(match.group(1), query)
             return
         match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)/artifact", path)
         if match:
             self._download_artifact(match.group(1))
+            return
+        match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)", path)
+        if match:
+            self._get_export_detail(match.group(1))
             return
         self._send_error_json(404, "not_found", "no such route: %s" % path)
 
@@ -190,6 +200,21 @@ class Handler(BaseHTTPRequestHandler):
             lease = store.get_lease(conn, "export:" + export_id)
             payload["lease"] = lease
             payload["download_url"] = "/api/exports/%s/artifact" % export_id
+            payload["evidence_url"] = "/api/exports/%s/evidence?index=0" % export_id
+        finally:
+            conn.close()
+        self._send_json(200, payload)
+
+    def _get_record_evidence(self, export_id, query):
+        raw_index = (query.get("index") or [""])[-1]
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            raise evidence.EvidenceError(422, "invalid_index",
+                                         "query parameter index must be a non-negative integer")
+        conn = store.connect()
+        try:
+            payload = evidence.build_evidence(conn, export_id, index)
         finally:
             conn.close()
         self._send_json(200, payload)
@@ -257,16 +282,45 @@ class Handler(BaseHTTPRequestHandler):
                 return
             export_id = doc.get("export_id")
             mode = doc.get("mode")
-            if not isinstance(export_id, str) or mode not in store.FAULT_MODES:
-                raise ApiError(422, "invalid_fault",
-                               "need export_id and mode in %s" % "/".join(store.FAULT_MODES))
-            conn = store.connect()
-            try:
-                store.set_fault(conn, export_id, mode)
-            finally:
-                conn.close()
-            self._send_json(202, {"ok": True, "export_id": export_id, "mode": mode})
-            return
+            if not isinstance(export_id, str):
+                raise ApiError(422, "invalid_fault", "need export_id and a supported mode")
+            if mode in store.FAULT_MODES:
+                conn = store.connect()
+                try:
+                    store.set_fault(conn, export_id, mode)
+                finally:
+                    conn.close()
+                self._send_json(202, {"ok": True, "export_id": export_id, "mode": mode})
+                return
+            if mode in ("delete_artifact", "corrupt_artifact"):
+                conn = store.connect()
+                try:
+                    row = store.get_export(conn, export_id)
+                    if not row:
+                        self._send_error_json(404, "not_found",
+                                              "unknown export_id: %s" % export_id)
+                        return
+                    if row["stage"] != "PUBLISHED":
+                        self._send_error_json(409, "not_published",
+                                              "export is in stage %s; tamper targets published artifacts"
+                                              % row["stage"])
+                        return
+                    result = artifacts.tamper_published(row, mode)
+                    with store.immediate(conn):
+                        store.journal(conn, export_id, "api", "test_tamper",
+                                      "%s -> %s" % (mode, result))
+                except artifacts.ArtifactMissing:
+                    self._send_error_json(410, "artifact_missing",
+                                          "published artifact file is already gone")
+                    return
+                finally:
+                    conn.close()
+                self._send_json(202, {"ok": True, "export_id": export_id,
+                                      "mode": mode, "result": result})
+                return
+            raise ApiError(422, "invalid_fault",
+                           "need mode in %s/delete_artifact/corrupt_artifact"
+                           % "/".join(store.FAULT_MODES))
         self._send_error_json(404, "not_found", "no such route: %s %s" % (method, path))
 
 

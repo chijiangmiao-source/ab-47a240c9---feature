@@ -75,18 +75,39 @@ def apply_rules(records, rules_doc):
     return out
 
 
-def _apply_one(record, rule):
-    path = rule["field"].split(".")
+def _resolve_target(record, path):
+    """Return (parent_dict, key) for a present dict-addressed target, else None."""
     node = record
     for segment in path[:-1]:
         if not isinstance(node, dict) or segment not in node:
-            return
+            return None
         node = node[segment]
     if not isinstance(node, dict):
-        return
+        return None
     key = path[-1]
     if key not in node:
+        return None
+    return node, key
+
+
+def _effective_rule(rule):
+    """Rule as actually executed, with defaulted parameters materialized."""
+    effective = dict(rule)
+    if rule["action"] == "redact":
+        effective.setdefault("replacement", "***")
+    elif rule["action"] == "round":
+        effective.setdefault("precision", 2)
+    elif rule["action"] == "hash":
+        effective.setdefault("length", 12)
+    return effective
+
+
+def _apply_one(record, rule):
+    path = rule["field"].split(".")
+    found = _resolve_target(record, path)
+    if found is None:
         return
+    node, key = found
     action = rule["action"]
     if action == "drop":
         del node[key]
@@ -99,3 +120,176 @@ def _apply_one(record, rule):
     elif action == "hash":
         length = rule.get("length", 12)
         node[key] = hashlib.sha256(canonical(node[key]).encode("utf-8")).hexdigest()[:length]
+
+
+def _apply_one_explained(record, rule):
+    """Apply one rule and return an evidence descriptor, or None when the rule
+    finds no target. Never embeds the pre-masking value."""
+    path = rule["field"].split(".")
+    found = _resolve_target(record, path)
+    if found is None:
+        return None
+    node, key = found
+    action = rule["action"]
+    effective = _effective_rule(rule)
+    if action == "drop":
+        del node[key]
+        return {
+            "action": "drop",
+            "present": False,
+            "evidence": {
+                "rule": effective,
+                "removed": True,
+                "note": "field removed from output; original value is not returned",
+            },
+        }
+    if action == "redact":
+        replacement = effective["replacement"]
+        node[key] = replacement
+        return {
+            "action": "redact",
+            "present": True,
+            "output": replacement,
+            "evidence": {
+                "rule": effective,
+                "replacement": replacement,
+                "replacement_length": len(replacement),
+                "note": "value replaced by the frozen rule's literal; original value is not returned",
+            },
+        }
+    if action == "round":
+        precision = effective["precision"]
+        value = node[key]
+        is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if is_number:
+            rounded = round(float(value), precision)
+            node[key] = rounded
+            return {
+                "action": "round",
+                "present": True,
+                "output": rounded,
+                "evidence": {
+                    "rule": effective,
+                    "precision": precision,
+                    "input_kind": "number",
+                    "applied": True,
+                },
+            }
+        return {
+            "action": "round",
+            "present": True,
+            "output": value,
+            "evidence": {
+                "rule": effective,
+                "precision": precision,
+                "input_kind": type(value).__name__,
+                "applied": False,
+                "note": "target is not a JSON number; passed through unchanged",
+            },
+        }
+    # hash
+    length = effective["length"]
+    digest = hashlib.sha256(canonical(node[key]).encode("utf-8")).hexdigest()[:length]
+    node[key] = digest
+    return {
+        "action": "hash",
+        "present": True,
+        "output": digest,
+        "evidence": {
+            "rule": effective,
+            "algorithm": "sha256",
+            "canonical_input": True,
+            "prefix_length": length,
+            "note": "output is the length-prefixed sha256 of the canonical value; preimage is not returned",
+        },
+    }
+
+
+def _iter_leaves(obj, prefix=()):
+    """Yield (path_tuple, value) for every non-dict terminal (lists are terminals:
+    rule paths only traverse objects)."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from _iter_leaves(value, prefix + (key,))
+    else:
+        yield prefix, obj
+
+
+def _dig(record, path):
+    node = record
+    for segment in path:
+        if not isinstance(node, dict) or segment not in node:
+            return None, False
+        node = node[segment]
+    return node, True
+
+
+def explain_record(record, rules_doc):
+    """Mask one record and produce per-field evidence.
+
+    Returns ``(masked_record, fields)`` where ``fields`` is a path-sorted list
+    of dicts::
+
+        {"field": "depth_m", "action": "redact", "present": True,
+         "output": "***", "evidence": {...}}
+
+    Every output field is accounted for exactly once: fields hit by a rule are
+    reported with that rule's descriptor; every other leaf is reported as
+    ``keep``. Pre-masking values of dropped/replaced/hashed fields are
+    deliberately absent from the evidence.
+    """
+    rules = rules_doc.get("rules", []) if isinstance(rules_doc, dict) else []
+    masked = copy.deepcopy(record)
+    staged = {}
+    for rule in rules:
+        descriptor = _apply_one_explained(masked, rule)
+        if descriptor is not None:
+            staged[rule["field"]] = descriptor
+
+    # Later rules can overwrite or remove an earlier rule's target (overlapping
+    # paths); a descriptor survives only when it still describes the output.
+    hit = {}
+    for field, descriptor in staged.items():
+        path = tuple(field.split("."))
+        value, exists = _dig(masked, path)
+        if descriptor["present"]:
+            if exists and value == descriptor["output"]:
+                hit[field] = descriptor
+        else:
+            # Removed key: the surrounding object chain must still be intact,
+            # otherwise a later ancestor rule collapsed the whole subtree.
+            parent, parent_exists = _dig(masked, path[:-1])
+            if parent_exists and isinstance(parent, dict):
+                hit[field] = descriptor
+
+    hit_paths = [tuple(field.split(".")) for field in hit]
+
+    def covered_by_rule(path):
+        for ancestor in hit_paths:
+            if path == ancestor:
+                return True
+            if path[: len(ancestor)] == ancestor:
+                value, exists = _dig(masked, ancestor)
+                # The hitting rule collapsed the subtree (drop/redact/hash); a
+                # pass-through (e.g. round on a non-number) leaves it intact.
+                if not exists or not isinstance(value, dict):
+                    return True
+        return False
+
+    fields = [dict({"field": field}, **descriptor) for field, descriptor in hit.items()]
+    for path, _value in _iter_leaves(masked):
+        if covered_by_rule(path):
+            continue
+        value, _exists = _dig(masked, path)
+        fields.append({
+            "field": ".".join(path),
+            "action": "keep",
+            "present": True,
+            "output": value,
+            "evidence": {
+                "rule": None,
+                "reason": "no masking rule transforms this field; value is retained as published",
+            },
+        })
+    fields.sort(key=lambda entry: entry["field"])
+    return masked, fields

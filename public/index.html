@@ -41,6 +41,21 @@
   a { color:var(--info); }
   .row { display:flex; gap:16px; } .row > div { flex:1; }
   #events { font-size:11.5px; }
+  .state { border-radius:6px; padding:10px 12px; font-size:13px; margin-top:8px; }
+  .state-loading { background:#eef3fa; color:var(--info); border:1px solid #c5d6ec; }
+  .state-unverifiable { background:#fbeae9; color:var(--bad); border:1px solid #ecc4c1; }
+  .state-verified { background:#e7f4ec; color:var(--ok); border:1px solid #bfe2cb; }
+  .state .code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-weight:700; }
+  .act { display:inline-block; padding:0 7px; border-radius:9px; font-size:10.5px; font-weight:700; }
+  .act-keep { background:#e8eef7; color:var(--info); }
+  .act-redact, .act-round { background:#fff3d6; color:var(--warn); }
+  .act-hash { background:#e9e4f7; color:#5a3aa0; }
+  .act-drop { background:#f3e0df; color:var(--bad); }
+  .ctrl { display:flex; align-items:center; gap:10px; margin-top:8px; flex-wrap:wrap; }
+  .ctrl button { margin:0; }
+  .ctrl input[type=number] { width:72px; padding:6px; font:12px ui-monospace,Menlo,Consolas,monospace;
+         border:1px solid var(--line); border-radius:6px; }
+  #evRules { font-size:11.5px; color:var(--muted); margin:6px 0; }
 </style>
 </head>
 <body>
@@ -84,6 +99,28 @@
     <h2>④ 处理日志 / 租约 <span class="meta" id="detailFor"></span></h2>
     <div id="lease" class="meta"></div>
     <pre id="events">点击列表中的“日志”查看。</pre>
+  </section>
+
+  <section class="wide">
+    <h2>⑤ 单条记录复核证据 <span class="meta" id="evidenceFor"></span></h2>
+    <div class="meta">仅对<b>已发布</b>且工件摘要仍可核验的导出提供：服务用冻结输入与冻结规则快照重新推导所选记录，
+      再与已发布工件的同序记录比对；比对失败、序号越界或工件缺失时拒绝给出结果。</div>
+    <div class="ctrl">
+      <label for="evIndex" style="margin:0;">记录稳定序号（0 起）</label>
+      <input type="number" id="evIndex" min="0" value="0">
+      <button id="loadEvidence">复核该记录</button>
+      <span class="meta" id="evRange"></span>
+    </div>
+    <div id="evidenceState" class="meta">请先在上方列表中对一条已发布导出点击“复核记录”。</div>
+    <div id="evidenceBody" hidden>
+      <div id="evRules" class="meta"></div>
+      <table>
+        <thead><tr><th>字段</th><th>处理</th><th>遮蔽后字段值</th><th>证据</th></tr></thead>
+        <tbody id="evFields"></tbody>
+      </table>
+      <label style="margin-top:10px;">发布工件中的该条记录（同序比对一致）</label>
+      <pre id="evRecord"></pre>
+    </div>
   </section>
 </main>
 <script>
@@ -151,7 +188,10 @@ async function refreshExports() {
       <td class="mono" title="${e.artifact_digest || ""}">${short(e.artifact_digest)}</td>
       <td>${e.attempts}</td>
       <td class="mono">${e.updated_at}</td>
-      <td>${dl} · <a href="#" onclick="showDetail('${e.export_id}');return false;">日志</a></td>
+      <td>${dl} · <a href="#" onclick="showDetail('${e.export_id}');return false;">日志</a>${
+        e.stage === "PUBLISHED"
+          ? ` · <a href="#" onclick="selectEvidence('${e.export_id}',0);return false;">复核记录</a>` : ""
+      }</td>
     </tr>`;
   }).join("");
   $("rows").innerHTML = rows || `<tr><td colspan="8" class="meta">暂无导出。</td></tr>`;
@@ -167,6 +207,90 @@ async function showDetail(exportId) {
   $("events").textContent = data.events.map(e => `${e.ts}  [${e.actor}]  ${e.event}${e.detail ? "  — " + e.detail : ""}`).join("\n") || "（无事件）";
 }
 window.showDetail = showDetail;
+
+// ------------------------------------------------------------ ⑤ 单条记录复核
+const ACTION_LABEL = { keep: "保留", drop: "删除", redact: "替换", round: "取整", hash: "哈希" };
+let currentEvidenceExport = null;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function evidenceState(kind, html) {
+  const box = $("evidenceState");
+  box.className = "state state-" + kind;
+  box.innerHTML = html;
+  box.hidden = false;
+}
+
+function selectEvidence(exportId, index) {
+  currentEvidenceExport = exportId;
+  $("evidenceFor").textContent = "— " + exportId;
+  $("evIndex").value = index;
+  $("evidenceBody").hidden = true;
+  loadEvidence();
+}
+window.selectEvidence = selectEvidence;
+
+async function loadEvidence() {
+  const exportId = currentEvidenceExport;
+  if (!exportId) {
+    evidenceState("unverifiable", "请先在列表中选择一条已发布导出。");
+    return;
+  }
+  let index = parseInt($("evIndex").value, 10);
+  if (!Number.isInteger(index) || index < 0) index = 0;
+  $("evidenceBody").hidden = true;
+  evidenceState("loading", "加载中… 正在核验工件摘要并用冻结输入与规则重演第 <b>" + index + "</b> 条记录。");
+  const { status, data } = await api("GET",
+    "/api/exports/" + encodeURIComponent(exportId) + "/evidence?index=" + index);
+  if (status === 200 && data.status === "verified") {
+    renderVerified(data);
+  } else {
+    $("evRange").textContent = "";
+    const code = data.error ? `<span class="code">${esc(data.error)}</span>` : "HTTP " + status;
+    evidenceState("unverifiable", "不可核验，服务已拒绝给出该记录：" + code +
+      (data.message ? " — " + esc(data.message) : ""));
+  }
+}
+
+function renderVerified(data) {
+  $("evRange").textContent = "工件共 " + data.record_count + " 条（序号 0–" + (data.record_count - 1) + "）";
+  const fr = data.frozen_rules;
+  const chips = fr.actions.map(a => {
+    const param = a.action === "round" ? "(" + a.precision + ")"
+      : a.action === "hash" ? "(" + (a.length || "") + ")"
+      : a.action === "redact" ? "(" + JSON.stringify(a.replacement) + ")" : "";
+    return `<span class="act act-${a.action}">${esc(a.field)}:${ACTION_LABEL[a.action] || a.action}${esc(param)}</span>`;
+  }).join(" ");
+  $("evRules").innerHTML =
+    "冻结规则摘要：<b class='mono'>" + esc(fr.rules_digest) + "</b> · 版本 <b>v" + fr.rules_version +
+    "</b> · " + fr.rule_count + " 条 " + chips +
+    "<br>输入摘要 <b class='mono'>" + esc(data.input_digest) + "</b> · 工件摘要 <b class='mono'>" +
+    esc(data.artifact_digest) + "</b>（已核验 ✓）· 冻结输入重演一致 ✓";
+
+  $("evFields").innerHTML = data.fields.map(f => {
+    const value = f.present ? "<span class='mono'>" + esc(JSON.stringify(f.output)) + "</span>"
+                            : "<span class='err'>（字段已删除）</span>";
+    return `<tr>
+      <td class="mono">${esc(f.field)}</td>
+      <td><span class="act act-${f.action}">${ACTION_LABEL[f.action] || f.action}</span></td>
+      <td>${value}</td>
+      <td class="mono" style="font-size:11px;">${esc(JSON.stringify(f.evidence, null, 0))}</td>
+    </tr>`;
+  }).join("");
+  $("evRecord").textContent = JSON.stringify(data.masked_record, null, 2);
+  $("evidenceBody").hidden = false;
+  evidenceState("verified",
+    "可复核结果：稳定序号 <b>" + data.record_index + "</b>（共 " + data.record_count +
+    " 条）· 回执 <b class='mono'>" + esc(data.receipt_id) + "</b> · 接收于 " + esc(data.received_at) +
+    " · 发布于 " + esc(data.published_at || "") +
+    " —— 工件摘要核验通过，且与冻结输入/规则快照重演结果一致。");
+}
+
+$("loadEvidence").onclick = loadEvidence;
+$("evIndex").addEventListener("keydown", (e) => { if (e.key === "Enter") loadEvidence(); });
 
 // 预填示例
 $("exportId").value = "TRACK-" + new Date().toISOString().slice(0,10).replaceAll("-","") + "-001";

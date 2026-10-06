@@ -137,3 +137,24 @@ def load_verified(export_row):
     if sha256_bytes(data) != export_row.get("artifact_digest"):
         raise DigestMismatch("artifact digest mismatch")
     return data
+
+
+def tamper_published(export_row, mode):
+    """Test-only anomaly injection against an already-published artifact.
+
+    ``delete_artifact`` removes the file; ``corrupt_artifact`` overwrites its
+    first bytes so the frozen digest no longer matches. Returns 'deleted' or
+    'corrupted'.
+    """
+    path = export_row.get("artifact_path")
+    if not path:
+        raise ArtifactMissing("export has no recorded artifact path")
+    if mode == "delete_artifact":
+        os.unlink(path)
+        return "deleted"
+    if mode == "corrupt_artifact":
+        with open(path, "r+b") as fh:
+            fh.seek(0)
+            fh.write(b"TAMPERED-BYTES")
+        return "corrupted"
+    raise ValueError("unknown tamper mode: %s" % mode)
